@@ -130,14 +130,14 @@
 
 {# acados linking libraries and flags #}
 {%- if acados_link_libs and os and os == "pc" %}
-	{%- set link_libs = acados_link_libs.qpoases ~ " " ~ acados_link_libs.hpmpc ~ " " ~ acados_link_libs.osqp -%}
+	{%- set link_libs = acados_link_libs.qpoases ~ " " ~ acados_link_libs.hpmpc ~ " " ~ acados_link_libs.osqp ~ " " ~ acados_link_libs.daqp -%}
 	{%- set openmp_flag = acados_link_libs.openmp %}
 {%- else %}
 	{%- set openmp_flag = " " %}
 	{%- if qp_solver == "FULL_CONDENSING_QPOASES" %}
 		{%- set link_libs = "-lqpOASES_e" %}
 	{%- elif qp_solver == "FULL_CONDENSING_DAQP" %}
-		{%- set link_libs = "-ldaqp" %}
+		{%- set link_libs = acados_link_libs.daqp %}
 	{%- else %}
 		{%- set link_libs = "" %}
 	{%- endif %}
