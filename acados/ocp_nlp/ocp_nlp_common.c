@@ -1659,6 +1659,9 @@ acados_size_t ocp_nlp_workspace_calculate_size(ocp_nlp_config *config, ocp_nlp_d
     // constraints
     size += (N+1)*sizeof(void *);
 
+    // doubles
+    size += nxu_max * sizeof(double); // tmp_nxu_double
+
     // module workspace
     if (opts->reuse_workspace)
     {
@@ -1749,6 +1752,7 @@ acados_size_t ocp_nlp_workspace_calculate_size(ocp_nlp_config *config, ocp_nlp_d
     }
 
     size += 8; // struct align
+    size += 64; // blasfeo align
     return size;
 }
 
@@ -1768,6 +1772,15 @@ ocp_nlp_workspace *ocp_nlp_workspace_assign(ocp_nlp_config *config, ocp_nlp_dims
     int *nu = dims->nu;
     int *ni = dims->ni;
     // int *nz = dims->nz;
+    int nxu_max = 0;
+    int nx_max = 0;
+    int ni_max = 0;
+    for (int i = 0; i <= N; i++)
+    {
+        nx_max = nx_max > nx[i] ? nx_max : nx[i];
+        nxu_max = nxu_max > (nx[i]+nu[i]) ? nxu_max : (nx[i]+nu[i]);
+        ni_max = ni_max > ni[i] ? ni_max : ni[i];
+    }
 
     char *c_ptr = (char *) raw_memory;
 
@@ -1796,16 +1809,11 @@ ocp_nlp_workspace *ocp_nlp_workspace_assign(ocp_nlp_config *config, ocp_nlp_dims
     work->weight_merit_fun = ocp_nlp_out_assign(config, dims, c_ptr);
     c_ptr += ocp_nlp_out_calculate_size(config, dims);
 
+    assign_and_advance_double(nxu_max, &work->tmp_nxu_double, &c_ptr);
+    // align for blasfeo mem
+    align_char_to(64, &c_ptr);
+
     // blasfeo_dvec
-    int nxu_max = 0;
-    int nx_max = 0;
-    int ni_max = 0;
-    for (int i = 0; i <= N; i++)
-    {
-        nx_max = nx_max > nx[i] ? nx_max : nx[i];
-        nxu_max = nxu_max > (nx[i]+nu[i]) ? nxu_max : (nx[i]+nu[i]);
-        ni_max = ni_max > ni[i] ? ni_max : ni[i];
-    }
     assign_and_advance_blasfeo_dvec_mem(nxu_max, &work->tmp_nxu, &c_ptr);
     assign_and_advance_blasfeo_dvec_mem(ni_max, &work->tmp_ni, &c_ptr);
     assign_and_advance_blasfeo_dvec_mem(nx_max, &work->dxnext_dy, &c_ptr);
@@ -1970,6 +1978,27 @@ void ocp_nlp_alias_memory_to_submodules(ocp_nlp_config *config, ocp_nlp_dims *di
         config->dynamics[i]->memory_set_sim_guess_ptr(nlp_mem->sim_guess+i, nlp_mem->set_sim_guess+i, nlp_mem->dynamics[i]);
         // NOTE: no z at terminal stage, since dynamics modules dont compute it.
         config->dynamics[i]->memory_set_z_alg_ptr(nlp_mem->z_alg+i, nlp_mem->dynamics[i]);
+
+        int cost_integration;
+        config->dynamics[i]->opts_get(config->dynamics[i], opts->dynamics[i],
+                                    "cost_computation", &cost_integration);
+        if (cost_integration)
+        {
+            // set pointers to cost function & gradient in integrator
+            double *cost_fun = config->cost[i]->memory_get_fun_ptr(nlp_mem->cost[i]);
+            struct blasfeo_dvec *cost_grad = config->cost[i]->memory_get_grad_ptr(nlp_mem->cost[i]);
+            struct blasfeo_dvec *y_ref = config->cost[i]->model_get_y_ref_ptr(nlp_in->cost[i]);
+            struct blasfeo_dmat *W_chol = config->cost[i]->memory_get_W_chol_ptr(nlp_mem->cost[i]);
+            struct blasfeo_dvec *W_chol_diag = config->cost[i]->memory_get_W_chol_diag_ptr(nlp_mem->cost[i]);
+            double *outer_hess_is_diag = config->cost[i]->get_outer_hess_is_diag_ptr(nlp_mem->cost[i], nlp_in->cost[i]);
+
+            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], nlp_mem->dynamics[i], "cost_grad", cost_grad);
+            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], nlp_mem->dynamics[i], "cost_fun", cost_fun);
+            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], nlp_mem->dynamics[i], "y_ref", y_ref);
+            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], nlp_mem->dynamics[i], "W_chol", W_chol);
+            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], nlp_mem->dynamics[i], "W_chol_diag", W_chol_diag);
+            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], nlp_mem->dynamics[i], "outer_hess_is_diag", outer_hess_is_diag);
+        }
     }
 
     // alias to cost_memory
@@ -2102,29 +2131,7 @@ void ocp_nlp_approximate_qp_matrices(ocp_nlp_config *config, ocp_nlp_dims *dims,
     int *nx = dims->nx;
     int *nu = dims->nu;
 
-    /* prepare memory */
-    int cost_integration;
-    for (int i = 0; i < N; i++)
-    {
-        config->dynamics[i]->opts_get(config->dynamics[i], opts->dynamics[i],
-                                        "cost_computation", &cost_integration);
-        if (cost_integration)
-        {
-            // set pointers to cost function & gradient in integrator
-            double *cost_fun = config->cost[i]->memory_get_fun_ptr(mem->cost[i]);
-            struct blasfeo_dvec *cost_grad = config->cost[i]->memory_get_grad_ptr(mem->cost[i]);
-            struct blasfeo_dvec *y_ref = config->cost[i]->model_get_y_ref_ptr(in->cost[i]);
-            struct blasfeo_dmat *W_chol = config->cost[i]->memory_get_W_chol_ptr(mem->cost[i]);
-
-            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], mem->dynamics[i], "cost_grad", cost_grad);
-            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], mem->dynamics[i], "cost_fun", cost_fun);
-            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], mem->dynamics[i], "y_ref", y_ref);
-            config->dynamics[i]->memory_set(config->dynamics[i], dims->dynamics[i], mem->dynamics[i], "W_chol", W_chol);
-        }
-    }
-
     /* stage-wise multiple shooting lagrangian evaluation */
-
 #if defined(ACADOS_WITH_OPENMP)
     #pragma omp parallel for
 #endif
@@ -2165,7 +2172,6 @@ void ocp_nlp_approximate_qp_matrices(ocp_nlp_config *config, ocp_nlp_dims *dims,
     }
 
     /* collect stage-wise evaluations */
-
 #if defined(ACADOS_WITH_OPENMP)
     #pragma omp parallel for
 #endif
@@ -2197,6 +2203,7 @@ void ocp_nlp_approximate_qp_matrices(ocp_nlp_config *config, ocp_nlp_dims *dims,
         }
         if (i > 0)
         {
+            // TODO: this could be simplified by not copying pi in the dynamics module.
             struct blasfeo_dvec *dyn_adj
                 = config->dynamics[i-1]->memory_get_adj_ptr(mem->dynamics[i-1]);
             blasfeo_daxpy(nx[i], 1.0, dyn_adj, nu[i-1]+nx[i-1], mem->dyn_adj+i, nu[i],
@@ -2251,6 +2258,134 @@ void ocp_nlp_approximate_qp_vectors_sqp(ocp_nlp_config *config,
         blasfeo_dveccp(2 * ni[i], mem->ineq_fun + i, 0, mem->qp_in->d + i, 0);
     }
 }
+
+
+// zero order update QP: Update all constraint evaluations in QP
+void ocp_nlp_zero_order_qp_update(ocp_nlp_config *config,
+    ocp_nlp_dims *dims, ocp_nlp_in *in, ocp_nlp_out *out, ocp_nlp_opts *opts,
+    ocp_nlp_memory *mem, ocp_nlp_workspace *work)
+{
+    int N = dims->N;
+    // int *nv = dims->nv;
+    int *nx = dims->nx;
+    int *nu = dims->nu;
+    int *ni = dims->ni;
+
+#if defined(ACADOS_WITH_OPENMP)
+    #pragma omp parallel for
+#endif
+    for (int i = 0; i <= N; i++)
+    {
+        // evaluate constraint residuals
+        config->constraints[i]->compute_fun(config->constraints[i], dims->constraints[i],
+            in->constraints[i], opts->constraints[i], mem->constraints[i], work->constraints[i]);
+        // copy ineq function value into QP
+        struct blasfeo_dvec *ineq_fun = config->constraints[i]->memory_get_fun_ptr(mem->constraints[i]);
+        blasfeo_dveccp(2 * ni[i], ineq_fun, 0, mem->qp_in->d + i, 0);
+        // copy into nlp_mem
+        blasfeo_dveccp(2 * ni[i], ineq_fun, 0, mem->ineq_fun + i, 0);
+    }
+
+#if defined(ACADOS_WITH_OPENMP)
+    #pragma omp parallel for
+#endif
+    for (int i=0; i<N; i++)
+    {
+        // dynamics
+        config->dynamics[i]->compute_fun(config->dynamics[i], dims->dynamics[i], in->dynamics[i],
+                                         opts->dynamics[i], mem->dynamics[i], work->dynamics[i]);
+
+        struct blasfeo_dvec *dyn_fun = config->dynamics[i]->memory_get_fun_ptr(mem->dynamics[i]);
+        blasfeo_dveccp(nx[i + 1], dyn_fun, 0, mem->qp_in->b + i, 0);
+        blasfeo_dveccp(nx[i + 1], dyn_fun, 0, mem->dyn_fun + i, 0);
+    }
+
+    // add gradient correction
+    // rqz += Hess * last_step = RQ * qp_out
+    for (int i = 0; i <= N; i++)
+    {
+        // NOTE: only lower triagonal of RSQ is stored
+        blasfeo_dsymv_l_mn(nx[i]+nu[i], nx[i]+nu[i], 1.0, mem->qp_in->RSQrq+i, 0, 0,
+                        mem->qp_out->ux+i, 0, 1.0, mem->qp_in->rqz+i, 0, mem->qp_in->rqz+i, 0);
+        // TODO: fix for ns > 0.
+    }
+}
+
+
+// Level C iterations Update all constraint evaluations in QP and Lagrange gradient
+void ocp_nlp_level_c_update(ocp_nlp_config *config,
+    ocp_nlp_dims *dims, ocp_nlp_in *in, ocp_nlp_out *out, ocp_nlp_opts *opts,
+    ocp_nlp_memory *mem, ocp_nlp_workspace *work)
+{
+    int N = dims->N;
+    int *nv = dims->nv;
+    int *nx = dims->nx;
+    int *nu = dims->nu;
+    int *ni = dims->ni;
+
+#if defined(ACADOS_WITH_OPENMP)
+    #pragma omp parallel for
+#endif
+    for (int i = 0; i <= N; i++)
+    {
+        // evaluate constraint residuals
+        config->constraints[i]->compute_fun(config->constraints[i], dims->constraints[i],
+            in->constraints[i], opts->constraints[i], mem->constraints[i], work->constraints[i]);
+        // copy ineq function value into QP
+        struct blasfeo_dvec *ineq_fun = config->constraints[i]->memory_get_fun_ptr(mem->constraints[i]);
+        blasfeo_dveccp(2 * ni[i], ineq_fun, 0, mem->qp_in->d + i, 0);
+        // copy into nlp_mem
+        blasfeo_dveccp(2 * ni[i], ineq_fun, 0, mem->ineq_fun + i, 0);
+    }
+
+#if defined(ACADOS_WITH_OPENMP)
+    #pragma omp parallel for
+#endif
+    for (int i=0; i<=N; i++)
+    {
+        // nlp mem: cost_grad
+        config->cost[i]->compute_gradient(config->cost[i], dims->cost[i], in->cost[i], opts->cost[i], mem->cost[i], work->cost[i]);
+        struct blasfeo_dvec *cost_grad = config->cost[i]->memory_get_grad_ptr(mem->cost[i]);
+        blasfeo_dveccp(nv[i], cost_grad, 0, mem->cost_grad + i, 0);
+        blasfeo_dveccp(nv[i], mem->cost_grad + i, 0, mem->qp_in->rqz + i, 0);
+    }
+
+
+#if defined(ACADOS_WITH_OPENMP)
+    #pragma omp parallel for
+#endif
+    for (int i=0; i<N; i++)
+    {
+        // dynamics
+        // config->dynamics[i]->update_qp_matrices(config->dynamics[i], dims->dynamics[i], in->dynamics[i],
+        config->dynamics[i]->compute_fun_and_adjoint(config->dynamics[i], dims->dynamics[i], in->dynamics[i],
+                                         opts->dynamics[i], mem->dynamics[i], work->dynamics[i]);
+
+        struct blasfeo_dvec *dyn_fun = config->dynamics[i]->memory_get_fun_ptr(mem->dynamics[i]);
+        blasfeo_dveccp(nx[i + 1], dyn_fun, 0, mem->qp_in->b + i, 0);
+        blasfeo_dveccp(nx[i + 1], dyn_fun, 0, mem->dyn_fun + i, 0);
+
+        // add adjoint contribution to gradient
+        struct blasfeo_dvec *dyn_adj = config->dynamics[i]->memory_get_adj_ptr(mem->dynamics[i]);
+        blasfeo_dvecad(nu[i] + nx[i], -1.0, dyn_adj, 0, mem->qp_in->rqz+i, 0);
+        // add adjoint contribution C * lambda_k
+        blasfeo_dgemv_n(nu[i] + nx[i], nx[i+1], -1.0, mem->qp_in->BAbt+i, 0, 0, out->pi+i, 0, 1.0, mem->qp_in->rqz+i, 0, mem->qp_in->rqz+i, 0);
+
+        // - I part is linear, so dont need to add that!
+        // blasfeo_dvecad(nx[i+1], 1.0, out->pi+i, 0, mem->qp_in->rqz+i, 0)
+
+        // DEBUG:
+        // printf("\ndyn_adj i %d\n", i);
+        // blasfeo_print_exp_tran_dvec(nu[i] + nx[i], dyn_adj, 0);
+        // blasfeo_dgemv_n(nu[i] + nx[i], nx[i+1], 1.0, mem->qp_in->BAbt+i, 0, 0, out->pi+i, 0, 0.0, &work->tmp_nxu, 0, &work->tmp_nxu, 0);
+        // printf("C * lam\n");
+        // blasfeo_print_exp_tran_dvec(nu[i] + nx[i], &work->tmp_nxu, 0);
+    }
+
+    // TODO:
+    // - adjoint call for inequalities as for dynamics
+}
+
 
 
 double ocp_nlp_compute_merit_gradient(ocp_nlp_config *config, ocp_nlp_dims *dims,
@@ -2958,8 +3093,8 @@ void ocp_nlp_res_compute(ocp_nlp_dims *dims, ocp_nlp_in *in, ocp_nlp_out *out, o
     // res_stat
     for (int i = 0; i <= N; i++)
     {
-        blasfeo_daxpy(nv[i], -1.0, mem->ineq_adj + i, 0, mem->cost_grad + i, 0, res->res_stat + i,
-                      0);
+        blasfeo_daxpy(nv[i], -1.0, mem->ineq_adj + i, 0, mem->cost_grad + i, 0,
+                      res->res_stat + i, 0);
         blasfeo_daxpy(nu[i] + nx[i], -1.0, mem->dyn_adj + i, 0, res->res_stat + i, 0,
                       res->res_stat + i, 0);
         blasfeo_dvecnrm_inf(nv[i], res->res_stat + i, 0, &tmp_res);
@@ -3047,4 +3182,3 @@ void ocp_nlp_cost_compute(ocp_nlp_config *config, ocp_nlp_dims *dims, ocp_nlp_in
 
     // printf("\ncomputed total cost: %e\n", total_cost);
 }
-
