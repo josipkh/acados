@@ -55,10 +55,10 @@ from .casadi_function_generation import (generate_c_code_explicit_ode,
 from .gnsf.detect_gnsf_structure import detect_gnsf_structure
 from .utils import (check_casadi_version, format_class_dict,
                     get_shared_lib_ext, get_shared_lib_prefix, get_shared_lib_dir,
-                    get_python_interface_path,
                     make_object_json_dumpable,
                     render_template, set_up_imported_gnsf_model,
-                    verbose_system_call)
+                    verbose_system_call, acados_lib_is_compiled_with_openmp,
+                    get_shared_lib)
 
 
 def sim_formulation_json_dump(acados_sim: AcadosSim, json_file='acados_sim.json'):
@@ -77,15 +77,6 @@ def sim_formulation_json_dump(acados_sim: AcadosSim, json_file='acados_sim.json'
     with open(json_file, 'w') as f:
         json.dump(sim_json, f, default=make_object_json_dumpable, indent=4, sort_keys=True)
 
-
-def sim_get_default_cmake_builder() -> CMakeBuilder:
-    """
-    If :py:class:`~acados_template.acados_sim_solver.AcadosSimSolver` is used with `CMake` this function returns a good first setting.
-    :return: default :py:class:`~acados_template.builders.CMakeBuilder`
-    """
-    cmake_builder = CMakeBuilder()
-    cmake_builder.options_on = ['BUILD_ACADOS_SIM_SOLVER_LIB']
-    return cmake_builder
 
 
 def sim_render_templates(json_file, model_name: str, code_export_dir, cmake_options: CMakeBuilder = None):
@@ -175,6 +166,10 @@ class AcadosSimSolver:
         dlclose.argtypes = [c_void_p]
         winmode = None
 
+    @property
+    def acados_lib_uses_omp(self,):
+        """`acados_lib_uses_omp` - flag indicating whether the acados library has been compiled with openMP."""
+        return self.__acados_lib_uses_omp
 
     @classmethod
     def generate(cls, acados_sim: AcadosSim, json_file='acados_sim.json', cmake_builder: CMakeBuilder = None):
@@ -239,7 +234,6 @@ class AcadosSimSolver:
     def __init__(self, acados_sim: AcadosSim, json_file='acados_sim.json', generate=True, build=True, cmake_builder: CMakeBuilder = None, verbose: bool = True):
 
         self.solver_created = False
-        self.acados_sim = acados_sim
         model_name = acados_sim.model.name
         self.model_name = model_name
 
@@ -253,6 +247,11 @@ class AcadosSimSolver:
             print("Warning: An AcadosSimSolver is created from an AcadosOcp description.",
                   "This only works if you created an AcadosOcpSolver before with the same description."
                   "Otherwise it leads to undefined behavior. Using an AcadosSim description is recommended.")
+            self.T = acados_sim.solver_options.Tsim
+        else:
+            self.T = acados_sim.solver_options.T
+
+        self.acados_sim = acados_sim
 
         if build:
             self.build(code_export_dir, cmake_builder=cmake_builder, verbose=verbose)
@@ -269,23 +268,14 @@ class AcadosSimSolver:
         # or [https://python.hotexamples.com/examples/_ctypes/-/dlclose/python-dlclose-function-examples.html]
         libacados_name = f'{lib_prefix}acados{lib_ext}'
         libacados_filepath = os.path.join(acados_sim.acados_lib_path, '..', lib_dir, libacados_name)
-        self.__acados_lib = DllLoader(libacados_filepath, winmode=self.winmode)
+        self.__acados_lib = get_shared_lib(libacados_filepath, self.winmode)
 
         # find out if acados was compiled with OpenMP
-        try:
-            self.__acados_lib_uses_omp = getattr(self.__acados_lib, 'omp_get_thread_num') is not None
-        except AttributeError as e:
-            self.__acados_lib_uses_omp = False
-        if verbose:
-            if self.__acados_lib_uses_omp:
-                print('acados was compiled with OpenMP.')
-            else:
-                print('acados was compiled without OpenMP.')
+        self.__acados_lib_uses_omp = acados_lib_is_compiled_with_openmp(self.__acados_lib, verbose)
+
         libacados_sim_solver_name = f'{lib_prefix}acados_sim_solver_{self.model_name}{lib_ext}'
         self.shared_lib_name = os.path.join(code_export_dir, libacados_sim_solver_name)
-
-        # get shared_lib
-        self.shared_lib = DllLoader(self.shared_lib_name, winmode=self.winmode)
+        self.shared_lib = get_shared_lib(self.shared_lib_name, winmode=self.winmode)
 
         # create capsule
         getattr(self.shared_lib, f"{model_name}_acados_sim_solver_create_capsule").restype = c_void_p
@@ -326,17 +316,21 @@ class AcadosSimSolver:
         self.gettable_scalars = ['CPUtime', 'time_tot', 'ADtime', 'time_ad', 'LAtime', 'time_la']
 
 
-    def simulate(self, x=None, u=None, z=None, p=None):
+    def simulate(self, x=None, u=None, z=None, xdot=None, p=None):
         """
-        Simulate the system forward for the given x, u, z, p and return x_next.
+        Simulate the system forward for the given x, u, p and return x_next.
+        The values xdot, z are used as initial guesses for implicit integrators, if provided.
         Wrapper around `solve()` taking care of setting/getting inputs/outputs.
         """
         if x is not None:
             self.set('x', x)
         if u is not None:
             self.set('u', u)
-        if z is not None:
-            self.set('z', z)
+        if self.acados_sim.solver_options.integrator_type == "IRK":
+            if z is not None:
+                self.set('z', z)
+            if xdot is not None:
+                self.set('xdot', xdot)
         if p is not None:
             self.set('p', p)
 
@@ -456,6 +450,9 @@ class AcadosSimSolver:
             if value_shape != tuple(dims):
                 raise Exception(f'AcadosSimSolver.set(): mismatching dimension' \
                     f' for field "{field_}" with dimension {tuple(dims)} (you have {value_shape}).')
+
+            if field_ == 'T':
+                self.T = value_
 
         # set
         if field_ in ['xdot', 'z']:

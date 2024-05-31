@@ -361,6 +361,15 @@ void ocp_qp_hpipm_solver_get(void *config_, void *qp_in_, void *qp_out_, void *o
         }
         d_ocp_qp_ipm_get_ric_K(qp_in, opts->hpipm_opts, mem->hpipm_workspace, stage, double_values);
     }
+    else if (!strcmp(field, "k"))
+    {
+        if ((size1 != nu) || (size2 != 1))
+        {
+            printf("\nocp_qp_hpipm_solver_get: size of field %s not as expected, got size %d %d.\n",
+                   field, size1, size2);
+        }
+        d_ocp_qp_ipm_get_ric_k(qp_in, opts->hpipm_opts, mem->hpipm_workspace, stage, double_values);
+    }
     else if (!strcmp(field, "Lr"))
     {
         if ((size1 != nu) || (size2 != nu))
@@ -406,6 +415,12 @@ void ocp_qp_hpipm_eval_sens(void *config_, void *param_qp_in_, void *sens_qp_out
 }
 
 
+void ocp_qp_hpipm_terminate(void *config_, void *mem_, void *work_)
+{
+    return;
+}
+
+
 
 void ocp_qp_hpipm_config_initialize_default(void *config_)
 {
@@ -425,6 +440,7 @@ void ocp_qp_hpipm_config_initialize_default(void *config_)
     config->solver_get = &ocp_qp_hpipm_solver_get;
     config->memory_reset = &ocp_qp_hpipm_memory_reset;
     config->eval_sens = &ocp_qp_hpipm_eval_sens;
+    config->terminate = &ocp_qp_hpipm_terminate;
 
     return;
 }

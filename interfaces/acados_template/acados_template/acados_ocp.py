@@ -36,7 +36,8 @@ from scipy.linalg import block_diag
 from copy import deepcopy
 
 import casadi as ca
-import os
+import os, shutil
+import json
 
 from .acados_model import AcadosModel
 from .acados_ocp_cost import AcadosOcpCost
@@ -44,12 +45,17 @@ from .acados_ocp_constraints import AcadosOcpConstraints
 from .acados_dims import AcadosOcpDims
 from .acados_ocp_options import AcadosOcpOptions
 
-from .utils import (get_acados_path, format_class_dict,
-                    get_shared_lib_ext, is_column, is_empty, casadi_length, check_if_square)
+from .utils import (get_acados_path, format_class_dict, make_object_json_dumpable, render_template,
+                    get_shared_lib_ext, is_column, is_empty, casadi_length, check_if_square,
+                    check_casadi_version)
 from .penalty_utils import symmetric_huber_penalty, one_sided_huber_penalty
 
 from .zoro_description import ZoroDescription, process_zoro_description
-
+from .casadi_function_generation import (
+    generate_c_code_conl_cost, generate_c_code_nls_cost, generate_c_code_external_cost,
+    generate_c_code_explicit_ode, generate_c_code_implicit_ode, generate_c_code_discrete_dynamics, generate_c_code_gnsf,
+    generate_c_code_constraint
+)
 
 class AcadosOcp:
     """
@@ -103,10 +109,13 @@ class AcadosOcp:
 
         self.__parameter_values = np.array([])
         self.__problem_class = 'OCP'
-        self.__name = None # set in make_consistent to model.name
 
         self.code_export_directory = 'c_generated_code'
         """Path to where code will be exported. Default: `c_generated_code`."""
+
+        self.simulink_opts = None
+        """Options to configure Simulink S-function blocks, mainly to activate possible Inputs and Outputs."""
+
 
     @property
     def parameter_values(self):
@@ -123,6 +132,9 @@ class AcadosOcp:
 
 
     def make_consistent(self) -> None:
+        """
+        Detect dimensions, perform sanity checks
+        """
         dims = self.dims
         cost = self.cost
         constraints = self.constraints
@@ -140,19 +152,7 @@ class AcadosOcp:
         ## cost
         # initial stage - if not set, copy fields from path constraints
         if cost.cost_type_0 is None:
-            cost.cost_type_0 = cost.cost_type
-            cost.W_0 = cost.W
-            cost.Vx_0 = cost.Vx
-            cost.Vu_0 = cost.Vu
-            cost.Vz_0 = cost.Vz
-            cost.yref_0 = cost.yref
-            cost.cost_ext_fun_type_0 = cost.cost_ext_fun_type
-            model.cost_y_expr_0 = model.cost_y_expr
-            model.cost_expr_ext_cost_0 = model.cost_expr_ext_cost
-            model.cost_expr_ext_cost_custom_hess_0 = model.cost_expr_ext_cost_custom_hess
-
-            model.cost_psi_expr_0 = model.cost_psi_expr
-            model.cost_r_in_psi_expr_0 = model.cost_r_in_psi_expr
+            self.copy_path_cost_to_stage_0()
 
         if cost.cost_type_0 == 'LINEAR_LS':
             check_if_square(cost.W_0, 'W_0')
@@ -309,7 +309,7 @@ class AcadosOcp:
         supports_cost_integration = lambda type : type in ['NONLINEAR_LS', 'CONVEX_OVER_NONLINEAR']
         if opts.cost_discretization == 'INTEGRATOR' and \
             any([not supports_cost_integration(cost) for cost in [cost.cost_type_0, cost.cost_type, cost.cost_type_e]]):
-            raise Exception('cost_discretization == INTEGRATOR only works with NONLINEAR_LS costs.')
+            raise Exception('cost_discretization == INTEGRATOR only works with cost in ["NONLINEAR_LS", "CONVEX_OVER_NONLINEAR"] costs.')
 
         ## constraints
         # initial
@@ -324,14 +324,13 @@ class AcadosOcp:
         if constraints.has_x0 and dims.nbx_0 != dims.nx:
             raise Exception(f"x0 should have shape nx = {dims.nx}.")
 
-        if all(constraints.lbx_0 == constraints.ubx_0) and dims.nbx_0 == dims.nx \
-            and dims.nbxe_0 is None \
-            and (constraints.idxbxe_0.shape == constraints.idxbx_0.shape)\
-                and all(constraints.idxbxe_0 == constraints.idxbx_0):
+        if constraints.has_x0:
             # case: x0 was set: nbx0 are all equalities.
             dims.nbxe_0 = dims.nbx_0
         elif constraints.idxbxe_0 is not None:
             dims.nbxe_0 = constraints.idxbxe_0.shape[0]
+            if any(constraints.idxbxe_0 > dims.nbx_0):
+                raise Exception(f'idxbxe_0 = {constraints.idxbxe_0} contains value > nbx_0 = {dims.nbx_0}.')
         elif dims.nbxe_0 is None:
             # case: x0 and idxbxe_0 were not set -> dont assume nbx0 to be equality constraints.
             dims.nbxe_0 = 0
@@ -363,12 +362,16 @@ class AcadosOcp:
             raise Exception('inconsistent dimension nbx, regarding idxbx, ubx, lbx.')
         else:
             dims.nbx = nbx
+        if any(constraints.idxbx > dims.nx):
+            raise Exception(f'idxbx = {constraints.idxbx} contains value > nx = {dims.nx}.')
 
         nbu = constraints.idxbu.shape[0]
         if constraints.ubu.shape[0] != nbu or constraints.lbu.shape[0] != nbu:
             raise Exception('inconsistent dimension nbu, regarding idxbu, ubu, lbu.')
         else:
             dims.nbu = nbu
+        if any(constraints.idxbu > dims.nu):
+            raise Exception(f'idxbu = {constraints.idxbu} contains value > nu = {dims.nu}.')
 
         # lg <= C * x + D * u <= ug
         ng = constraints.lg.shape[0]
@@ -412,6 +415,8 @@ class AcadosOcp:
             raise Exception('inconsistent dimension nbx_e, regarding idxbx_e, ubx_e, lbx_e.')
         else:
             dims.nbx_e = nbx_e
+        if any(constraints.idxbx_e > dims.nx):
+            raise Exception(f'idxbx_e = {constraints.idxbx_e} contains value > nx = {dims.nx}.')
 
         ng_e = constraints.lg_e.shape[0]
         if constraints.ug_e.shape[0] != ng_e or constraints.C_e.shape[0] != ng_e:
@@ -444,6 +449,8 @@ class AcadosOcp:
         nsbx = constraints.idxsbx.shape[0]
         if nsbx > nbx:
             raise Exception(f'inconsistent dimension nsbx = {nsbx}. Is greater than nbx = {nbx}.')
+        if any(constraints.idxsbx > nbx):
+            raise Exception(f'idxsbx = {constraints.idxsbx} contains value > nbx = {nbx}.')
         if is_empty(constraints.lsbx):
             constraints.lsbx = np.zeros((nsbx,))
         elif constraints.lsbx.shape[0] != nsbx:
@@ -457,6 +464,8 @@ class AcadosOcp:
         nsbu = constraints.idxsbu.shape[0]
         if nsbu > nbu:
             raise Exception(f'inconsistent dimension nsbu = {nsbu}. Is greater than nbu = {nbu}.')
+        if any(constraints.idxsbu > nbu):
+            raise Exception(f'idxsbu = {constraints.idxsbu} contains value > nbu = {nbu}.')
         if is_empty(constraints.lsbu):
             constraints.lsbu = np.zeros((nsbu,))
         elif constraints.lsbu.shape[0] != nsbu:
@@ -470,6 +479,8 @@ class AcadosOcp:
         nsh = constraints.idxsh.shape[0]
         if nsh > nh:
             raise Exception(f'inconsistent dimension nsh = {nsh}. Is greater than nh = {nh}.')
+        if any(constraints.idxsh > nh):
+            raise Exception(f'idxsh = {constraints.idxsh} contains value > nh = {nh}.')
         if is_empty(constraints.lsh):
             constraints.lsh = np.zeros((nsh,))
         elif constraints.lsh.shape[0] != nsh:
@@ -483,6 +494,8 @@ class AcadosOcp:
         nsphi = constraints.idxsphi.shape[0]
         if nsphi > dims.nphi:
             raise Exception(f'inconsistent dimension nsphi = {nsphi}. Is greater than nphi = {dims.nphi}.')
+        if any(constraints.idxsphi > dims.nphi):
+            raise Exception(f'idxsphi = {constraints.idxsphi} contains value > nphi = {dims.nphi}.')
         if is_empty(constraints.lsphi):
             constraints.lsphi = np.zeros((nsphi,))
         elif constraints.lsphi.shape[0] != nsphi:
@@ -496,6 +509,8 @@ class AcadosOcp:
         nsg = constraints.idxsg.shape[0]
         if nsg > ng:
             raise Exception(f'inconsistent dimension nsg = {nsg}. Is greater than ng = {ng}.')
+        if any(constraints.idxsg > ng):
+            raise Exception(f'idxsg = {constraints.idxsg} contains value > ng = {ng}.')
         if is_empty(constraints.lsg):
             constraints.lsg = np.zeros((nsg,))
         elif constraints.lsg.shape[0] != nsg:
@@ -524,13 +539,15 @@ class AcadosOcp:
         if wrong_fields != []:
             raise Exception(f'Inconsistent size for fields {", ".join(wrong_fields)}, with dimension {dim}, \n\t'\
                 + f'Detected ns = {ns} = nsbx + nsbu + nsg + nsh + nsphi.\n\t'\
-                + f'With nsbx = {nsbx}, nsbu = {nsbu}, nsg = {nsg}, nsh = {nsh}, nsphi = {nsphi}')
+                + f'With nsbx = {nsbx}, nsbu = {nsbu}, nsg = {nsg}, nsh = {nsh}, nsphi = {nsphi}.')
         dims.ns = ns
 
         # slack dimensions at initial node
         nsh_0 = constraints.idxsh_0.shape[0]
         if nsh_0 > nh_0:
             raise Exception(f'inconsistent dimension nsh_0 = {nsh_0}. Is greater than nh_0 = {nh_0}.')
+        if any(constraints.idxsh_0 > nh_0):
+            raise Exception(f'idxsh_0 = {constraints.idxsh_0} contains value > nh_0 = {nh_0}.')
         if is_empty(constraints.lsh_0):
             constraints.lsh_0 = np.zeros((nsh_0,))
         elif constraints.lsh_0.shape[0] != nsh_0:
@@ -544,6 +561,8 @@ class AcadosOcp:
         nsphi_0 = constraints.idxsphi_0.shape[0]
         if nsphi_0 > dims.nphi_0:
             raise Exception(f'inconsistent dimension nsphi_0 = {nsphi_0}. Is greater than nphi_0 = {dims.nphi_0}.')
+        if any(constraints.idxsphi_0 > dims.nphi_0):
+            raise Exception(f'idxsphi_0 = {constraints.idxsphi_0} contains value > nphi_0 = {dims.nphi_0}.')
         if is_empty(constraints.lsphi_0):
             constraints.lsphi_0 = np.zeros((nsphi_0,))
         elif constraints.lsphi_0.shape[0] != nsphi_0:
@@ -590,13 +609,15 @@ class AcadosOcp:
         if wrong_fields != []:
             raise Exception(f'Inconsistent size for fields {", ".join(wrong_fields)}, with dimension {dim}, \n\t'\
                 + f'Detected ns_0 = {ns_0} = nsbu + nsg + nsh_0 + nsphi_0.\n\t'\
-                + f'With nsbu = {nsbu}, nsg = {nsg}, nsh_0 = {nsh_0}, nsphi_0 = {nsphi_0}')
+                + f'With nsbu = {nsbu}, nsg = {nsg}, nsh_0 = {nsh_0}, nsphi_0 = {nsphi_0}.')
         dims.ns_0 = ns_0
 
         # slacks at terminal node
         nsbx_e = constraints.idxsbx_e.shape[0]
         if nsbx_e > nbx_e:
             raise Exception(f'inconsistent dimension nsbx_e = {nsbx_e}. Is greater than nbx_e = {nbx_e}.')
+        if any(constraints.idxsbx_e > nbx_e):
+            raise Exception(f'idxsbx_e = {constraints.idxsbx_e} contains value > nbx_e = {nbx_e}.')
         if is_empty(constraints.lsbx_e):
             constraints.lsbx_e = np.zeros((nsbx_e,))
         elif constraints.lsbx_e.shape[0] != nsbx_e:
@@ -608,6 +629,8 @@ class AcadosOcp:
         dims.nsbx_e = nsbx_e
 
         nsh_e = constraints.idxsh_e.shape[0]
+        if nsh_e > nh_e:
+            raise Exception(f'inconsistent dimension nsh_e = {nsh_e}. Is greater than nh_e = {nh_e}.')
         if nsh_e > nh_e:
             raise Exception(f'inconsistent dimension nsh_e = {nsh_e}. Is greater than nh_e = {nh_e}.')
         if is_empty(constraints.lsh_e):
@@ -623,6 +646,8 @@ class AcadosOcp:
         nsphi_e = constraints.idxsphi_e.shape[0]
         if nsphi_e > dims.nphi_e:
             raise Exception(f'inconsistent dimension nsphi_e = {nsphi_e}. Is greater than nphi_e = {dims.nphi_e}.')
+        if nsphi_e > dims.nphi_e:
+            raise Exception(f'inconsistent dimension nsphi_e = {nsphi_e}. Is greater than nphi_e = {dims.nphi_e}.')
         if is_empty(constraints.lsphi_e):
             constraints.lsphi_e = np.zeros((nsphi_e,))
         elif constraints.lsphi_e.shape[0] != nsphi_e:
@@ -634,6 +659,8 @@ class AcadosOcp:
         dims.nsphi_e = nsphi_e
 
         nsg_e = constraints.idxsg_e.shape[0]
+        if nsg_e > ng_e:
+            raise Exception(f'inconsistent dimension nsg_e = {nsg_e}. Is greater than ng_e = {ng_e}.')
         if nsg_e > ng_e:
             raise Exception(f'inconsistent dimension nsg_e = {nsg_e}. Is greater than ng_e = {ng_e}.')
         if is_empty(constraints.lsg_e):
@@ -665,7 +692,7 @@ class AcadosOcp:
         if wrong_field != "":
             raise Exception(f'Inconsistent size for field {wrong_field}, with dimension {dim}, \n\t'\
                 + f'Detected ns_e = {ns_e} = nsbx_e + nsg_e + nsh_e + nsphi_e.\n\t'\
-                + f'With nsbx_e = {nsbx_e}, nsg_e = {nsg_e}, nsh_e = {nsh_e}, nsphi_e = {nsphi_e}')
+                + f'With nsbx_e = {nsbx_e}, nsg_e = {nsg_e}, nsh_e = {nsh_e}, nsphi_e = {nsphi_e}.')
 
         dims.ns_e = ns_e
 
@@ -752,6 +779,42 @@ class AcadosOcp:
             if cost.cost_type_e != "LINEAR_LS":
                 raise Exception('fixed_hess is only compatible LINEAR_LS cost_type_e.')
 
+        # solution sensitivities
+        type_constraint_pairs = [("path", model.con_h_expr), ("initial", model.con_h_expr_0),
+                                 ("terminal", model.con_h_expr_e),
+                                 ("path", model.con_phi_expr), ("initial", model.con_phi_expr_0), ("terminal", model.con_phi_expr_e),
+                                 ("path", model.con_r_expr), ("initial", model.con_r_expr_0), ("terminal", model.con_r_expr_e)]
+
+        if opts.with_solution_sens_wrt_params:
+            if cost.cost_type != "EXTERNAL" or cost.cost_type_0 != "EXTERNAL" or cost.cost_type_e != "EXTERNAL":
+                raise Exception('with_solution_sens_wrt_params is only compatible with EXTERNAL cost_type.')
+            if opts.integrator_type != "DISCRETE":
+                raise Exception('with_solution_sens_wrt_params is only compatible with DISCRETE dynamics.')
+            for horizon_type, constraint in type_constraint_pairs:
+                if constraint is not None and any(ca.which_depends(constraint, model.p)):
+                    raise Exception(f'with_solution_sens_wrt_params is only implemented if constraints depend not on parameters. Got parameter dependency for {horizon_type} constraint.')
+
+        if opts.with_value_sens_wrt_params:
+            if cost.cost_type != "EXTERNAL" or cost.cost_type_0 != "EXTERNAL" or cost.cost_type_e != "EXTERNAL":
+                raise Exception('with_value_sens_wrt_params is only compatible with EXTERNAL cost_type.')
+            if opts.integrator_type != "DISCRETE":
+                raise Exception('with_value_sens_wrt_params is only compatible with DISCRETE dynamics.')
+            for horizon_type, constraint in type_constraint_pairs:
+                if constraint is not None and any(ca.which_depends(constraint, model.p)):
+                    raise Exception(f'with_value_sens_wrt_params is only implemented if constraints depend not on parameters. Got parameter dependency for {horizon_type} constraint.')
+
+        if opts.qp_solver_cond_N is None:
+            opts.qp_solver_cond_N = dims.N
+
+        if opts.nlp_solver_type == "DDP":
+            if opts.qp_solver != "PARTIAL_CONDENSING_HPIPM" or opts.qp_solver_cond_N != dims.N:
+                raise Exception(f'DDP solver only supported for PARTIAL_CONDENSING_HPIPM with qp_solver_cond_N == N, got qp solver {opts.qp_solver} and qp_solver_cond_N {opts.qp_solver_cond_N}, N {dims.N}.')
+            if any([dims.nbu, dims.nbx, dims.ng, dims.nh, dims.nphi]):
+                raise Exception('DDP only supports initial state constraints, got path constraints.')
+            if  any([dims.ng_e, dims.nphi_e, dims.nh_e]):
+                raise Exception('DDP only supports initial state constraints, got terminal constraints.')
+
+        # zoRO
         if self.zoro_description is not None:
             if not isinstance(self.zoro_description, ZoroDescription):
                 raise Exception('zoro_description should be of type ZoroDescription or None')
@@ -759,6 +822,146 @@ class AcadosOcp:
                 self.zoro_description = process_zoro_description(self.zoro_description)
 
         return
+
+
+    def _get_external_function_header_templates(self, ) -> list:
+        dims = self.dims
+        name = self.model.name
+        template_list = []
+
+        # dynamics
+        model_dir = os.path.join(self.code_export_directory, f'{name}_model')
+        template_list.append(('model.in.h', f'{name}_model.h', model_dir))
+        # constraints
+        if any(np.array([dims.nh, dims.nh_e, dims.nh_0, dims.nphi, dims.nphi_e, dims.nphi_0]) > 0):
+            constraints_dir = os.path.join(self.code_export_directory, f'{name}_constraints')
+            template_list.append(('constraints.in.h', f'{name}_constraints.h', constraints_dir))
+        # cost
+        if any([self.cost.cost_type != 'LINEAR_LS', self.cost.cost_type_0 != 'LINEAR_LS', self.cost.cost_type_e != 'LINEAR_LS']):
+            cost_dir = os.path.join(self.code_export_directory, f'{name}_cost')
+            template_list.append(('cost.in.h', f'{name}_cost.h', cost_dir))
+
+        return template_list
+
+
+    def __get_template_list(self, cmake_builder=None) -> list:
+        """
+        returns a list of tuples in the form:
+        (input_filename, output_filname)
+        or
+        (input_filename, output_filname, output_directory)
+        """
+        name = self.model.name
+        template_list = []
+
+        template_list.append(('main.in.c', f'main_{name}.c'))
+        template_list.append(('acados_solver.in.c', f'acados_solver_{name}.c'))
+        template_list.append(('acados_solver.in.h', f'acados_solver_{name}.h'))
+        template_list.append(('acados_solver.in.pxd', f'acados_solver.pxd'))
+        if cmake_builder is not None:
+            template_list.append(('CMakeLists.in.txt', 'CMakeLists.txt'))
+        else:
+            template_list.append(('Makefile.in', 'Makefile'))
+
+        # sim
+        template_list.append(('acados_sim_solver.in.c', f'acados_sim_solver_{name}.c'))
+        template_list.append(('acados_sim_solver.in.h', f'acados_sim_solver_{name}.h'))
+        template_list.append(('main_sim.in.c', f'main_sim_{name}.c'))
+
+        # model
+        template_list += self._get_external_function_header_templates()
+
+        # Simulink
+        if self.simulink_opts is not None:
+            template_file = os.path.join('matlab_templates', 'acados_solver_sfun.in.c')
+            template_list.append((template_file, f'acados_solver_sfunction_{name}.c'))
+            template_file = os.path.join('matlab_templates', 'make_sfun.in.m')
+            template_list.append((template_file, f'make_sfun_{name}.m'))
+            template_file = os.path.join('matlab_templates', 'acados_sim_solver_sfun.in.c')
+            template_list.append((template_file, f'acados_sim_solver_sfunction_{name}.c'))
+            template_file = os.path.join('matlab_templates', 'make_sfun_sim.in.m')
+            template_list.append((template_file, f'make_sfun_sim_{name}.m'))
+
+        return template_list
+
+
+    def render_templates(self, json_file: str, cmake_builder=None):
+
+        # check json file
+        json_path = os.path.abspath(json_file)
+        if not os.path.exists(json_path):
+            raise Exception(f'Path "{json_path}" not found!')
+
+        template_list = self.__get_template_list(cmake_builder=cmake_builder)
+
+        # Render templates
+        for tup in template_list:
+            output_dir = self.code_export_directory if len(tup) <= 2 else tup[2]
+            render_template(tup[0], tup[1], output_dir, json_path)
+
+        # Custom templates
+        acados_template_path = os.path.dirname(os.path.abspath(__file__))
+        custom_template_glob = os.path.join(acados_template_path, 'custom_update_templates', '*')
+        for tup in self.solver_options.custom_templates:
+            render_template(tup[0], tup[1], self.code_export_directory, json_path, template_glob=custom_template_glob)
+        return
+
+
+    def dump_to_json(self, json_file: str) -> None:
+        with open(json_file, 'w') as f:
+            json.dump(self.to_dict(), f, default=make_object_json_dumpable, indent=4, sort_keys=True)
+        return
+
+
+    def generate_external_functions(self):
+        model = self.model
+        constraints = self.constraints
+
+        # options for code generation
+        code_gen_opts = dict()
+        code_gen_opts['generate_hess'] = self.solver_options.hessian_approx == 'EXACT'
+        code_gen_opts['with_solution_sens_wrt_params'] = self.solver_options.with_solution_sens_wrt_params
+        code_gen_opts['with_value_sens_wrt_params'] = self.solver_options.with_value_sens_wrt_params
+        code_gen_opts['code_export_directory'] = self.code_export_directory
+
+        # create code_export_dir, model_dir
+        model_dir = os.path.join(code_gen_opts['code_export_directory'], model.name + '_model')
+        if not os.path.exists(model_dir):
+            os.makedirs(model_dir)
+
+        check_casadi_version()
+        if self.model.dyn_ext_fun_type == 'casadi':
+            if self.solver_options.integrator_type == 'ERK':
+                generate_c_code_explicit_ode(model, code_gen_opts)
+            elif self.solver_options.integrator_type == 'IRK':
+                generate_c_code_implicit_ode(model, code_gen_opts)
+            elif self.solver_options.integrator_type == 'LIFTED_IRK':
+                if model.t != []:
+                    raise NotImplementedError("LIFTED_IRK with time-varying dynamics not implemented yet.")
+                generate_c_code_implicit_ode(model, code_gen_opts)
+            elif self.solver_options.integrator_type == 'GNSF':
+                generate_c_code_gnsf(model, code_gen_opts)
+            elif self.solver_options.integrator_type == 'DISCRETE':
+                generate_c_code_discrete_dynamics(model, code_gen_opts)
+            else:
+                raise Exception("ocp_generate_external_functions: unknown integrator type.")
+        else:
+            target_location = os.path.join(code_gen_opts['code_export_directory'], model_dir, model.dyn_generic_source)
+            shutil.copyfile(model.dyn_generic_source, target_location)
+
+        stage_types = ['initial', 'path', 'terminal']
+
+        for attr_nh, attr_nphi, stage_type in zip(['nh_0', 'nh', 'nh_e'], ['nphi_0', 'nphi', 'nphi_e'], stage_types):
+            if getattr(self.dims, attr_nh) > 0 or getattr(self.dims, attr_nphi) > 0:
+                generate_c_code_constraint(model, constraints, stage_type, code_gen_opts)
+
+        for attr, stage_type in zip(['cost_type_0', 'cost_type', 'cost_type_e'], stage_types):
+            if getattr(self.cost, attr) == 'NONLINEAR_LS':
+                generate_c_code_nls_cost(model, stage_type, code_gen_opts)
+            elif getattr(self.cost, attr) == 'CONVEX_OVER_NONLINEAR':
+                generate_c_code_conl_cost(model, stage_type, code_gen_opts)
+            elif getattr(self.cost, attr) == 'EXTERNAL':
+                generate_c_code_external_cost(model, stage_type, code_gen_opts)
 
 
     def remove_x0_elimination(self) -> None:
@@ -780,6 +983,26 @@ class AcadosOcp:
         ocp_dict = format_class_dict(ocp_dict)
         return ocp_dict
 
+
+    def copy_path_cost_to_stage_0(self):
+        """Set all cost definitions at stage 0 to the corresponding path cost definitions."""
+        cost = self.cost
+        model = self.model
+
+        cost.cost_type_0 = cost.cost_type
+        cost.W_0 = cost.W
+        cost.Vx_0 = cost.Vx
+        cost.Vu_0 = cost.Vu
+        cost.Vz_0 = cost.Vz
+        cost.yref_0 = cost.yref
+        cost.cost_ext_fun_type_0 = cost.cost_ext_fun_type
+
+        model.cost_y_expr_0 = model.cost_y_expr
+        model.cost_expr_ext_cost_0 = model.cost_expr_ext_cost
+        model.cost_expr_ext_cost_custom_hess_0 = model.cost_expr_ext_cost_custom_hess
+        model.cost_psi_expr_0 = model.cost_psi_expr
+        model.cost_r_in_psi_expr_0 = model.cost_r_in_psi_expr
+        return
 
     def translate_nls_cost_to_conl(self):
         """
@@ -836,6 +1059,7 @@ class AcadosOcp:
         upper_bound: Optional[float],
         lower_bound: Optional[float],
         residual_name: str = "new_residual",
+        constraint_type: str = "path",
     ) -> None:
         """
         Formulate a constraint as an L2 penalty and add it to the current cost.
@@ -848,21 +1072,52 @@ class AcadosOcp:
 
         # compute violation expression
         violation_expr = 0.0
+        y_ref_new = np.zeros(1)
         if upper_bound is not None:
             violation_expr = ca.fmax(violation_expr, (constr_expr - upper_bound))
         if lower_bound is not None:
             violation_expr = ca.fmax(violation_expr, (lower_bound - constr_expr))
 
         # add penalty as cost
-        self.cost.yref = np.concatenate((self.cost.yref, np.zeros(1)))
-        self.model.cost_y_expr = ca.vertcat(self.model.cost_y_expr, violation_expr)
-        if self.cost.cost_type == "NONLINEAR_LS":
-            self.cost.W = block_diag(self.cost.W, weight)
-        elif self.cost.cost_type == "CONVEX_OVER_NONLINEAR":
-            new_residual = casadi_symbol(residual_name, constr_expr.shape)
-            self.model.cost_r_in_psi_expr = ca.vertcat(self.model.cost_r_in_psi_expr, new_residual)
-            self.model.cost_psi_expr += .5 * weight * new_residual**2
-
+        if constraint_type == "path":
+            self.cost.yref = np.concatenate((self.cost.yref, y_ref_new))
+            self.model.cost_y_expr = ca.vertcat(self.model.cost_y_expr, violation_expr)
+            if self.cost.cost_type == "NONLINEAR_LS":
+                self.cost.W = block_diag(self.cost.W, weight)
+            elif self.cost.cost_type == "CONVEX_OVER_NONLINEAR":
+                new_residual = casadi_symbol(residual_name, constr_expr.shape)
+                self.model.cost_r_in_psi_expr = ca.vertcat(self.model.cost_r_in_psi_expr, new_residual)
+                self.model.cost_psi_expr += .5 * weight * new_residual**2
+            elif self.cost.cost_type == "EXTERNAL":
+                self.model.cost_expr_ext_cost += .5 * weight * violation_expr**2
+            else:
+                raise NotImplementedError(f"formulate_constraint_as_L2_penalty not implemented for path cost with cost_type {self.cost.cost_type}.")
+        elif constraint_type == "initial":
+            self.cost.yref_0 = np.concatenate((self.cost.yref_0, y_ref_new))
+            self.model.cost_y_expr_0 = ca.vertcat(self.model.cost_y_expr_0, violation_expr)
+            if self.cost.cost_type_0 == "NONLINEAR_LS":
+                self.cost.W_0 = block_diag(self.cost.W_0, weight)
+            elif self.cost.cost_type_0 == "CONVEX_OVER_NONLINEAR":
+                new_residual = casadi_symbol(residual_name, constr_expr.shape)
+                self.model.cost_r_in_psi_expr_0 = ca.vertcat(self.model.cost_r_in_psi_expr_0, new_residual)
+                self.model.cost_psi_expr_0 += .5 * weight * new_residual**2
+            elif self.cost.cost_type_0 == "EXTERNAL":
+                self.model.cost_expr_ext_cost_0 += .5 * weight * violation_expr**2
+            else:
+                raise NotImplementedError(f"formulate_constraint_as_L2_penalty not implemented for initial cost with cost_type_0 {self.cost.cost_type_0}.")
+        elif constraint_type == "terminal":
+            self.cost.yref_e = np.concatenate((self.cost.yref_e, y_ref_new))
+            self.model.cost_y_expr_e = ca.vertcat(self.model.cost_y_expr_e, violation_expr)
+            if self.cost.cost_type_e == "NONLINEAR_LS":
+                self.cost.W_e = block_diag(self.cost.W_e, weight)
+            elif self.cost.cost_type_e == "CONVEX_OVER_NONLINEAR":
+                new_residual = casadi_symbol(residual_name, constr_expr.shape)
+                self.model.cost_r_in_psi_expr_e = ca.vertcat(self.model.cost_r_in_psi_expr_e, new_residual)
+                self.model.cost_psi_expr_e += .5 * weight * new_residual**2
+            elif self.cost.cost_type_e == "EXTERNAL":
+                self.model.cost_expr_ext_cost_e += .5 * weight * violation_expr**2
+            else:
+                raise NotImplementedError(f"formulate_constraint_as_L2_penalty not implemented for terminal cost with cost_type_e {self.cost.cost_type_e}.")
         return
 
 
@@ -891,12 +1146,10 @@ class AcadosOcp:
             casadi_symbol = ca.SX.sym
             casadi_zeros = ca.SX.zeros
 
-
         # if (upper_bound is None or lower_bound is None):
         #     raise NotImplementedError("only symmetric Huber for now")
         if upper_bound is None and lower_bound is None:
             raise ValueError("Either upper or lower bound must be provided.")
-
 
         if self.cost.cost_type != "CONVEX_OVER_NONLINEAR":
             raise Exception("Huber penalty is only supported for CONVEX_OVER_NONLINEAR cost type.")
@@ -971,4 +1224,120 @@ class AcadosOcp:
             self.constraints.lg = ca.vertcat(self.constraints.lg, lg)
             self.constraints.ug = ca.vertcat(self.constraints.ug, ug)
 
+        return
+
+
+    def translate_to_feasibility_problem(self, keep_x0=False, keep_cost=False) -> None:
+        """
+        Translate an OCP to a feasibility problem by removing all cost term and then formulating all constraints as L2 penalties.
+
+        Note: all weights are set to 1.0 for now.
+        Options to specify weights should be implemented later for advanced use cases.
+        """
+
+        self.model.make_consistent(self.dims) # sets the correct MX/SX defaults
+        model = self.model
+        cost = self.cost
+        constraints = self.constraints
+        new_constraints = AcadosOcpConstraints()
+
+        if keep_cost:
+            # initial stage - if not set, copy fields from path constraints
+            if cost.cost_type_0 is None:
+                self.copy_path_cost_to_stage_0()
+        else:
+            # set cost to zero
+            cost.cost_type = "NONLINEAR_LS"
+            cost.cost_type_e = "NONLINEAR_LS"
+            cost.cost_type_0 = "NONLINEAR_LS"
+
+            cost.yref = np.array([])
+            cost.yref_0 = np.array([])
+            cost.yref_e = np.array([])
+
+            model.cost_y_expr = ca.SX.zeros((0, 0))
+            model.cost_y_expr_e = ca.SX.zeros((0, 0))
+            model.cost_y_expr_0 = ca.SX.zeros((0, 0))
+
+            cost.W = np.zeros((0, 0))
+            cost.W_e = np.zeros((0, 0))
+            cost.W_0 = np.zeros((0, 0))
+
+        expr_bound_list = [
+            (model.x[constraints.idxbx], constraints.lbx, constraints.ubx),
+            (model.u[constraints.idxbu], constraints.lbu, constraints.ubu),
+            (model.con_h_expr, constraints.lh, constraints.uh),
+        ]
+
+        if casadi_length(model.con_phi_expr) > 0:
+            phi_o_r_expr = ca.substitute(model.con_phi_expr, model.con_r_in_phi, model.con_r_expr)
+            expr_bound_list.append((phi_o_r_expr, constraints.lphi, constraints.uphi))
+            # NOTE: for now, we don't exploit convex over nonlinear structure of phi
+
+        for constr_expr, lower_bound, upper_bound in expr_bound_list:
+            for i in range(casadi_length(constr_expr)):
+                self.formulate_constraint_as_L2_penalty(constr_expr[i], weight=1.0, upper_bound=upper_bound[i], lower_bound=lower_bound[i])
+
+        model.con_h_expr = None
+        model.con_phi_expr = None
+        model.con_r_expr = None
+        model.con_r_in_phi = None
+
+        # formulate **terminal** constraints as L2 penalties
+        expr_bound_list_e = [
+            (model.x[constraints.idxbx_e], constraints.lbx_e, constraints.ubx_e),
+            (model.con_h_expr_e, constraints.lh_e, constraints.uh_e),
+        ]
+
+        if casadi_length(model.con_phi_expr_e) > 0:
+            phi_o_r_expr_e = ca.substitute(model.con_phi_expr_e, model.con_r_in_phi_e, model.con_r_expr_e)
+            expr_bound_list_e.append((phi_o_r_expr_e, constraints.lphi_e, constraints.uphi_e))
+            # NOTE: for now, we don't exploit convex over nonlinear structure of phi
+
+        for constr_expr, lower_bound, upper_bound in expr_bound_list_e:
+            for i in range(casadi_length(constr_expr)):
+                self.formulate_constraint_as_L2_penalty(constr_expr[i], weight=1.0, upper_bound=upper_bound[i], lower_bound=lower_bound[i], constraint_type="terminal")
+
+        model.con_h_expr_e = None
+        model.con_phi_expr_e = None
+        model.con_r_expr_e = None
+        model.con_r_in_phi_e = None
+
+        expr_bound_list_0 = [
+            (model.u[constraints.idxbu], constraints.lbu, constraints.ubu),
+            (model.con_h_expr_0, constraints.lh_0, constraints.uh_0),
+        ]
+
+        if keep_x0:
+            if constraints.has_x0:
+                new_constraints.x0 = constraints.lbx_0
+            else:
+                raise NotImplementedError("translate_to_feasibility_problem: keep_x0 not defined for problems without x0 constraints.")
+        else:
+            expr_bound_list_0.append((model.x[constraints.idxbx_0], constraints.lbx_0, constraints.ubx_0))
+
+        if casadi_length(model.con_phi_expr_0) > 0:
+            phi_o_r_expr_0 = ca.substitute(model.con_phi_expr_0, model.con_r_in_phi_0, model.con_r_expr_0)
+            expr_bound_list_0.append((phi_o_r_expr_0, constraints.lphi_0, constraints.uphi_0))
+            # NOTE: for now, we don't exploit convex over nonlinear structure of phi
+
+        for constr_expr, lower_bound, upper_bound in expr_bound_list_0:
+            for i in range(casadi_length(constr_expr)):
+                self.formulate_constraint_as_L2_penalty(constr_expr[i], weight=1.0, upper_bound=upper_bound[i], lower_bound=lower_bound[i], constraint_type="initial")
+
+        model.con_h_expr_0 = None
+        model.con_phi_expr_0 = None
+        model.con_r_expr_0 = None
+        model.con_r_in_phi_0 = None
+
+        # delete constraint fromulation from constraints object
+        self.constraints = new_constraints
+
+    def augment_with_t0_param(self) -> None:
+        """Add a parameter t0 to the model and set it to 0.0."""
+        if self.model.t0 is not None:
+            raise Exception("Parameter t0 is already present in the model.")
+        self.model.t0 = ca.SX.sym("t0")
+        self.model.p = ca.vertcat(self.model.p, self.model.t0)
+        self.parameter_values = np.append(self.parameter_values, [0.0])
         return

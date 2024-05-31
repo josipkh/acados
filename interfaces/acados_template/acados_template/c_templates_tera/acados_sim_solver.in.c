@@ -39,6 +39,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+{%- if solver_options.num_threads_in_batch_solve > 1 %}
+// openmp
+#include <omp.h>
+{%- endif %}
+
 // acados
 #include "acados_c/external_function_interface.h"
 #include "acados_c/sim_interface.h"
@@ -409,6 +414,26 @@ int {{ model.name }}_acados_sim_solve({{ model.name }}_sim_solver_capsule *capsu
         printf("error in {{ model.name }}_acados_sim_solve()! Exiting.\n");
 
     return status;
+}
+
+
+void {{ model.name }}_acados_sim_batch_solve({{ model.name }}_sim_solver_capsule ** capsules, int N_batch)
+{
+{% if solver_options.num_threads_in_batch_solve > 1 %}
+    int num_threads_bkp = omp_get_num_threads();
+    omp_set_num_threads({{ solver_options.num_threads_in_batch_solve }});
+
+    #pragma omp parallel for
+{%- endif %}
+    for (int i = 0; i < N_batch; i++)
+    {
+        sim_solve(capsules[i]->acados_sim_solver, capsules[i]->acados_sim_in, capsules[i]->acados_sim_out);
+    }
+
+{% if solver_options.num_threads_in_batch_solve > 1 %}
+    omp_set_num_threads( num_threads_bkp );
+{%- endif %}
+    return;
 }
 
 

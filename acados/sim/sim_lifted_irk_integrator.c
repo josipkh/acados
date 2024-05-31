@@ -46,7 +46,6 @@
 #include "blasfeo/include/blasfeo_d_aux.h"
 #include "blasfeo/include/blasfeo_d_aux_ext_dep.h"
 #include "blasfeo/include/blasfeo_d_blas.h"
-#include "blasfeo/include/blasfeo_target.h"
 #include "blasfeo/include/blasfeo_v_aux_ext_dep.h"
 
 
@@ -94,6 +93,10 @@ void sim_lifted_irk_dims_set(void *config_, void *dims_, const char *field, cons
     else if (!strcmp(field, "nz"))
     {
         dims->nz = *value;
+    }
+    else if (!strcmp(field, "np"))
+    {
+        // np dimension not needed
     }
     else
     {
