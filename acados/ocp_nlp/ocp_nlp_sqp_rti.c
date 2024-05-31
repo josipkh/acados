@@ -343,12 +343,6 @@ acados_size_t ocp_nlp_sqp_rti_workspace_calculate_size(void *config_,
     // nlp
     size += ocp_nlp_workspace_calculate_size(config, dims, nlp_opts);
 
-    // qp in
-    size += ocp_qp_in_calculate_size(dims->qp_solver->orig_dims);
-
-    // qp out
-    size += ocp_qp_out_calculate_size(dims->qp_solver->orig_dims);
-
     if (opts->ext_qp_res)
     {
         // qp res
@@ -378,14 +372,6 @@ static void ocp_nlp_sqp_rti_cast_workspace(
     work->nlp_work = ocp_nlp_workspace_assign(
         config, dims, nlp_opts, nlp_mem, c_ptr);
     c_ptr += ocp_nlp_workspace_calculate_size(config, dims, nlp_opts);
-
-    // qp in
-    work->tmp_qp_in = ocp_qp_in_assign(dims->qp_solver->orig_dims, c_ptr);
-    c_ptr += ocp_qp_in_calculate_size(dims->qp_solver->orig_dims);
-
-    // qp out
-    work->tmp_qp_out = ocp_qp_out_assign(dims->qp_solver->orig_dims, c_ptr);
-    c_ptr += ocp_qp_out_calculate_size(dims->qp_solver->orig_dims);
 
     if (opts->ext_qp_res)
     {
@@ -454,7 +440,7 @@ static void prepare_full_residual_computation(ocp_nlp_config *config,
     for (int i=0; i < N; i++)
     {
         // dynamics: evaluate function and adjoint
-        config->dynamics[i]->compute_fun_and_adjoint(config->dynamics[i], dims->dynamics[i], in->dynamics[i],
+        config->dynamics[i]->compute_fun_and_adj(config->dynamics[i], dims->dynamics[i], in->dynamics[i],
                                          opts->dynamics[i], mem->dynamics[i], work->dynamics[i]);
     }
 
@@ -702,30 +688,6 @@ static void ocp_nlp_sqp_rti_feedback_step(ocp_nlp_config *config, ocp_nlp_dims *
  * AS-RTI functionality
 ****************************/
 
-static void copy_ocp_nlp_out(ocp_nlp_dims *dims, ocp_nlp_out *from, ocp_nlp_out *to)
-{
-    // extract dims
-    int N = dims->N;
-    int *nv = dims->nv;
-    int *nx = dims->nx;
-    // int *nu = dims->nu;
-    int *ni = dims->ni;
-    int *nz = dims->nz;
-    for (int i = 0; i <= N; i++)
-    {
-        blasfeo_dveccp(nv[i], from->ux+i, 0, to->ux+i, 0);
-        blasfeo_dveccp(nz[i], from->z+i, 0, to->z+i, 0);
-        blasfeo_dveccp(2*ni[i], from->lam+i, 0, to->lam+i, 0);
-        blasfeo_dveccp(2*ni[i], from->t+i, 0, to->t+i, 0);
-    }
-
-    for (int i = 0; i < N; i++)
-        blasfeo_dveccp(nx[i+1], from->pi+i, 0, to->pi+i, 0);
-
-    return;
-}
-
-
 static void as_rti_sanity_checks(ocp_nlp_config *config, ocp_nlp_dims *dims, ocp_nlp_sqp_rti_opts *opts)
 {
     // sanity checks
@@ -901,6 +863,11 @@ static void ocp_nlp_sqp_rti_preparation_advanced_step(ocp_nlp_config *config, oc
         copy_ocp_nlp_out(dims, tmp_nlp_out, nlp_out);
         // perform QP solve (implemented as feedback)
         // similar to  ocp_nlp_sqp_rti_feedback_step
+        if (opts->rti_log_residuals)
+        {
+            // NOTE: redo all residual computations after loading iterate from tmp to undo changes to memory in modules
+            prepare_full_residual_computation(config, dims, nlp_in, nlp_out, nlp_opts, nlp_mem, nlp_work);
+        }
 
         // update QP rhs for SQP (step prim var, abs dual var)
         acados_tic(&timer1);
@@ -943,6 +910,14 @@ static void ocp_nlp_sqp_rti_preparation_advanced_step(ocp_nlp_config *config, oc
         config->regularize->correct_dual_sol(config->regularize,
             dims->regularize, opts->nlp_opts->regularize, nlp_mem->regularize_mem);
         mem->time_reg += acados_toc(&timer1);
+
+        if (nlp_opts->print_level > 0)
+        {
+            printf("\n------- qp_in AS-RTI-A preparation --------\n");
+            print_ocp_qp_in(nlp_mem->qp_in);
+            printf("\n------- qp_out AS-RTI-A preparation --------\n");
+            print_ocp_qp_out(nlp_mem->qp_out);
+        }
 
         // globalization
         acados_tic(&timer1);
@@ -1327,64 +1302,38 @@ void ocp_nlp_sqp_rti_eval_param_sens(void *config_, void *dims_, void *opts_,
     // ocp_nlp_sqp_rti_cast_workspace(config, dims, opts, mem, work);
     ocp_nlp_workspace *nlp_work = work->nlp_work;
 
-    d_ocp_qp_copy_all(nlp_mem->qp_in, work->tmp_qp_in);
-    d_ocp_qp_set_rhs_zero(work->tmp_qp_in);
+    ocp_nlp_common_eval_param_sens(config, dims, opts->nlp_opts, nlp_mem, nlp_work,
+                                 field, stage, index, sens_nlp_out);
 
-    double one = 1.0;
-
-    if ((!strcmp("ex", field)) && (stage==0))
-    {
-        d_ocp_qp_set_el("lbx", stage, index, &one, work->tmp_qp_in);
-        d_ocp_qp_set_el("ubx", stage, index, &one, work->tmp_qp_in);
-
-//        d_ocp_qp_print(work->tmp_qp_in->dim, work->tmp_qp_in);
-
-        config->qp_solver->eval_sens(config->qp_solver, dims->qp_solver,
-            work->tmp_qp_in, work->tmp_qp_out, opts->nlp_opts->qp_solver_opts,
-            nlp_mem->qp_solver_mem, nlp_work->qp_work);
-
-//        d_ocp_qp_sol_print(work->tmp_qp_out->dim, work->tmp_qp_out);
-//        exit(1);
-
-        /* copy tmp_qp_out into sens_nlp_out */
-        int i;
-
-        int N = dims->N;
-        int *nv = dims->nv;
-        int *nx = dims->nx;
-        // int *nu = dims->nu;
-        int *ni = dims->ni;
-        // int *nz = dims->nz;
-
-        for (i = 0; i <= N; i++)
-        {
-            blasfeo_dveccp(nv[i], work->tmp_qp_out->ux + i, 0,
-                sens_nlp_out->ux + i, 0);
-
-            if (i < N)
-                blasfeo_dveccp(nx[i + 1], work->tmp_qp_out->pi + i, 0,
-                    sens_nlp_out->pi + i, 0);
-
-            blasfeo_dveccp(2 * ni[i], work->tmp_qp_out->lam + i, 0,
-                sens_nlp_out->lam + i, 0);
-
-            blasfeo_dveccp(2 * ni[i], work->tmp_qp_out->t + i, 0,
-                sens_nlp_out->t + i, 0);
-
-        }
-    }
-    else
-    {
-        printf("\nerror: field %s at stage %d not available in \
-            ocp_nlp_sqp_rti_eval_param_sens\n", field, stage);
-
-        exit(1);
-    }
     mem->time_solution_sensitivities = acados_toc(&timer0);
 
     return;
 }
 
+
+void ocp_nlp_sqp_rti_eval_lagr_grad_p(void *config_, void *dims_, void *nlp_in_, void *opts_,
+    void *mem_, void *work_, const char *field, void *grad_p)
+{
+    acados_timer timer0;
+    acados_tic(&timer0);
+
+    ocp_nlp_dims *dims = dims_;
+    ocp_nlp_config *config = config_;
+    ocp_nlp_sqp_rti_opts *opts = opts_;
+    ocp_nlp_sqp_rti_memory *mem = mem_;
+    ocp_nlp_memory *nlp_mem = mem->nlp_mem;
+    ocp_nlp_in *nlp_in = nlp_in_;
+
+    ocp_nlp_sqp_rti_workspace *work = work_;
+    // ocp_nlp_sqp_rti_cast_workspace(config, dims, opts, mem, work);
+    ocp_nlp_workspace *nlp_work = work->nlp_work;
+
+    ocp_nlp_common_eval_lagr_grad_p(config, dims, nlp_in, opts->nlp_opts, nlp_mem, nlp_work, field, grad_p);
+
+    mem->time_solution_sensitivities = acados_toc(&timer0);
+
+    return;
+}
 
 
 void ocp_nlp_sqp_rti_get(void *config_, void *dims_, void *mem_,
@@ -1394,7 +1343,7 @@ void ocp_nlp_sqp_rti_get(void *config_, void *dims_, void *mem_,
     ocp_nlp_dims *dims = dims_;
     ocp_nlp_sqp_rti_memory *mem = mem_;
 
-    if (!strcmp("sqp_iter", field))
+    if (!strcmp("sqp_iter", field) || !strcmp("nlp_iter", field))
     {
         int *value = return_value_;
         *value = mem->sqp_iter;
@@ -1599,6 +1548,17 @@ void ocp_nlp_sqp_rti_work_get(void *config_, void *dims_, void *work_,
     }
 }
 
+
+void ocp_nlp_sqp_rti_terminate(void *config_, void *mem_, void *work_)
+{
+    ocp_nlp_config *config = config_;
+    ocp_nlp_sqp_rti_memory *mem = mem_;
+    ocp_nlp_sqp_rti_workspace *work = work_;
+
+    config->qp_solver->terminate(config->qp_solver, mem->nlp_mem->qp_solver_mem, work->nlp_work->qp_work);
+}
+
+
 void ocp_nlp_sqp_rti_config_initialize_default(void *config_)
 {
     ocp_nlp_config *config = (ocp_nlp_config *) config_;
@@ -1615,11 +1575,13 @@ void ocp_nlp_sqp_rti_config_initialize_default(void *config_)
     config->evaluate = &ocp_nlp_sqp_rti;
     config->memory_reset_qp_solver = &ocp_nlp_sqp_rti_memory_reset_qp_solver;
     config->eval_param_sens = &ocp_nlp_sqp_rti_eval_param_sens;
+    config->eval_lagr_grad_p = &ocp_nlp_sqp_rti_eval_lagr_grad_p;
     config->config_initialize_default = &ocp_nlp_sqp_rti_config_initialize_default;
     config->precompute = &ocp_nlp_sqp_rti_precompute;
     config->get = &ocp_nlp_sqp_rti_get;
     config->opts_get = &ocp_nlp_sqp_rti_opts_get;
     config->work_get = &ocp_nlp_sqp_rti_work_get;
+    config->terminate = &ocp_nlp_sqp_rti_terminate;
 
     return;
 }

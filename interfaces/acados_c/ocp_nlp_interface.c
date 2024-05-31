@@ -54,6 +54,7 @@
 #include "acados/ocp_nlp/ocp_nlp_reg_noreg.h"
 #include "acados/ocp_nlp/ocp_nlp_sqp.h"
 #include "acados/ocp_nlp/ocp_nlp_sqp_rti.h"
+#include "acados/ocp_nlp/ocp_nlp_ddp.h"
 #include "acados/utils/mem.h"
 
 
@@ -188,6 +189,9 @@ ocp_nlp_config *ocp_nlp_config_create(ocp_nlp_plan_t plan)
             break;
         case SQP_RTI:
             ocp_nlp_sqp_rti_config_initialize_default(config);
+            break;
+        case DDP:
+            ocp_nlp_ddp_config_initialize_default(config);
             break;
         case INVALID_NLP_SOLVER:
             printf("\nerror: ocp_nlp_config_create: forgot to initialize plan->nlp_solver\n");
@@ -624,6 +628,10 @@ int ocp_nlp_dims_get_from_attr(ocp_nlp_config *config, ocp_nlp_dims *dims, ocp_n
     {
         return dims->nz[stage];
     }
+    else if (!strcmp(field, "p"))
+    {
+        return dims->np[stage];
+    }
     else if (!strcmp(field, "lam") || !strcmp(field, "t"))
     {
         return 2*dims->ni[stage];
@@ -913,6 +921,10 @@ void ocp_nlp_cost_dims_get_from_attr(ocp_nlp_config *config, ocp_nlp_dims *dims,
         dims_out[0] = dims->nx[stage] + dims->nu[stage];
         dims_out[1] = dims->nx[stage] + dims->nu[stage];
     }
+    else if (!strcmp(field, "scaling"))
+    {
+        dims_out[0] = 1;
+    }
     else
     {
         printf("\nerror: ocp_nlp_cost_dims_get_from_attr: field %s not available\n", field);
@@ -1031,8 +1043,9 @@ ocp_nlp_solver *ocp_nlp_solver_create(ocp_nlp_config *config, ocp_nlp_dims *dims
 }
 
 
-void ocp_nlp_solver_destroy(void *solver)
+void ocp_nlp_solver_destroy(ocp_nlp_solver *solver)
 {
+    solver->config->terminate(solver->config, solver->mem, solver->work);
     free(solver);
 }
 
@@ -1068,6 +1081,11 @@ void ocp_nlp_eval_param_sens(ocp_nlp_solver *solver, char *field, int stage, int
     return;
 }
 
+void ocp_nlp_eval_lagrange_grad_p(ocp_nlp_solver *solver, ocp_nlp_in *nlp_in, const char *field, double *out)
+{
+    solver->config->eval_lagr_grad_p(solver->config, solver->dims, nlp_in, solver->opts, solver->mem, solver->work, field, out);
+}
+
 
 void ocp_nlp_eval_residuals(ocp_nlp_solver *solver, ocp_nlp_in *nlp_in, ocp_nlp_out *nlp_out)
 {
@@ -1093,6 +1111,23 @@ void ocp_nlp_eval_cost(ocp_nlp_solver *solver, ocp_nlp_in *nlp_in, ocp_nlp_out *
 
     ocp_nlp_cost_compute(config, dims, nlp_in, nlp_out, nlp_opts, nlp_mem, nlp_work);
 }
+
+
+void ocp_nlp_eval_params_jac(ocp_nlp_solver *solver, ocp_nlp_in *nlp_in, ocp_nlp_out *nlp_out)
+{
+    ocp_nlp_config *config = solver->config;
+    ocp_nlp_memory *nlp_mem;
+    ocp_nlp_opts *nlp_opts;
+    ocp_nlp_workspace *nlp_work;
+    ocp_nlp_dims *dims = solver->dims;
+
+    config->get(config, solver->dims, solver->mem, "nlp_mem", &nlp_mem);
+    config->opts_get(config, solver->dims, solver->opts, "nlp_opts", &nlp_opts);
+    config->work_get(config, solver->dims, solver->work, "nlp_work", &nlp_work);
+
+    ocp_nlp_params_jac_compute(config, dims, nlp_in, nlp_opts, nlp_mem, nlp_work);
+}
+
 
 
 void ocp_nlp_get(ocp_nlp_config *config, ocp_nlp_solver *solver,
