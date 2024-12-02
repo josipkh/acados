@@ -85,7 +85,9 @@ jobs:
       if: always()
       with:
         command: |
-            cd ${{runner.workspace}}/acados/interfaces/acados_matlab_octave; acados_install_windows('-DBUILD_SHARED_LIBS=OFF -DACADOS_WITH_OSQP=ON')
+            cd ${{runner.workspace}}/acados/interfaces/acados_matlab_octave
+            acados_env_variables_windows
+            acados_install_windows('-DBUILD_SHARED_LIBS=OFF -DACADOS_WITH_OSQP=ON')
 
     - name: Run minimal MATLAB example
       uses: matlab-actions/run-command@v2
