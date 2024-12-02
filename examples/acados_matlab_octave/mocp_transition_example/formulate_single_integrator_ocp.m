@@ -44,9 +44,9 @@ function ocp = formulate_single_integrator_ocp(settings)
     ocp.model.cost_y_expr_e = ocp.model.x;
 
     u_max = 5.0;
-    ocp.constraints.lbu = [-u_max];
-    ocp.constraints.ubu = [u_max];
-    ocp.constraints.idxbu = [0];
+    ocp.constraints.lbu = -u_max;
+    ocp.constraints.ubu = u_max;
+    ocp.constraints.idxbu = 0;
 
     ocp.constraints.x0 = settings.X0;
 end
