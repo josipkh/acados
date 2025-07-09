@@ -67,12 +67,25 @@ def export_pendulum_ode_model() -> AcadosModel:
     # dynamics
     cos_theta = cos(theta)
     sin_theta = sin(theta)
-    denominator = m_cart + m - m*cos_theta*cos_theta
-    f_expl = vertcat(v1,
-                     dtheta,
-                     (-m*l*sin_theta*dtheta*dtheta + m*g*cos_theta*sin_theta+F)/denominator,
-                     (-m*l*cos_theta*sin_theta*dtheta*dtheta + F*cos_theta+(m_cart+m)*g*sin_theta)/(l*denominator)
-                     )
+
+    # model from eq. (11) in https://arxiv.org/abs/1910.13753
+    # NOTE: positive angle is counterclockwise
+    # denominator = m_cart + m - m*cos_theta*cos_theta
+    # f_expl = vertcat(v1,
+    #                  dtheta,
+    #                  (-m*l*sin_theta*dtheta*dtheta + m*g*cos_theta*sin_theta+F)/denominator,
+    #                  (-m*l*cos_theta*sin_theta*dtheta*dtheta + F*cos_theta+(m_cart+m)*g*sin_theta)/(l*denominator)
+    #                  )
+
+    # model from eq. (23)-(24) in https://coneural.org/florian/papers/05_cart_pole.pdf
+    # NOTE: positive angle is clockwise
+    ddtheta_num = g * sin_theta + cos_theta * ((-F - m * l * dtheta*dtheta * sin_theta) / (m_cart + m))
+    ddtheta_den = l * (4/3 - (m * cos_theta * cos_theta) / (m_cart + m))
+    ddtheta = ddtheta_num / ddtheta_den
+    ddx_num = F + m * l * (dtheta * dtheta * sin_theta - ddtheta * cos_theta)
+    ddx_den = m_cart + m
+    ddx = ddx_num / ddx_den
+    f_expl = vertcat(v1, dtheta, ddx, ddtheta)
 
     f_impl = xdot - f_expl
 
