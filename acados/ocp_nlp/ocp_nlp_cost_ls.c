@@ -44,8 +44,8 @@
 #include <string.h>
 
 // blasfeo
-#include "blasfeo/include/blasfeo_d_aux.h"
-#include "blasfeo/include/blasfeo_d_blas.h"
+#include "blasfeo_d_aux.h"
+#include "blasfeo_d_blas.h"
 // acados
 #include "acados/utils/mem.h"
 
@@ -369,6 +369,88 @@ int ocp_nlp_cost_ls_model_set(void *config_, void *dims_, void *model_,
 }
 
 
+int ocp_nlp_cost_ls_model_get(void *config_, void *dims_, void *model_,
+                                 const char *field, void *value_)
+{
+    int status = ACADOS_SUCCESS;
+
+    if ( !config_ || !dims_ || !model_ || !value_ )
+    {
+        printf("ocp_nlp_cost_ls_model_set: got NULL pointer, setting field %s\n", field);
+        printf("config %p, dims %p model %p, value %p \n", config_, dims_, model_, value_);
+        exit(1);
+    }
+
+    ocp_nlp_cost_ls_dims *dims = dims_;
+    ocp_nlp_cost_ls_model *model = model_;
+
+    int nx = dims->nx;
+    int nu = dims->nu;
+    int ny = dims->ny;
+    int ns = dims->ns;
+    int nz = dims->nz;
+
+    double * value = (double *) value_;
+
+    if (!strcmp(field, "W"))
+    {
+        blasfeo_unpack_dmat(ny, ny, &model->W, 0, 0, value, ny);
+    }
+    else if (!strcmp(field, "Cyt"))
+    {
+        blasfeo_unpack_dmat(nx+nu, ny,  &model->Cyt, 0, 0, value, nx+nu);
+    }
+    else if (!strcmp(field, "Vx"))
+    {
+        blasfeo_unpack_tran_dmat(nx, ny, &model->Cyt, nu, 0, value, ny);
+    }
+    else if (!strcmp(field, "Vu"))
+    {
+        blasfeo_unpack_tran_dmat(nu, ny, &model->Cyt, 0, 0, value, ny);
+    }
+    // TODO(andrea): inconsistent order x, u, z. Make x, z, u later!
+    else if (!strcmp(field, "Vz"))
+    {
+        blasfeo_unpack_dmat(ny, nz, &model->Vz, 0, 0, value, ny);
+    }
+    else if (!strcmp(field, "y_ref") || !strcmp(field, "yref"))
+    {
+        blasfeo_unpack_dvec(ny, &model->y_ref, 0, value, 1);
+    }
+    else if (!strcmp(field, "Zl"))
+    {
+        blasfeo_unpack_dvec(ns, &model->Z, 0, value, 1);
+    }
+    else if (!strcmp(field, "Zu"))
+    {
+        blasfeo_unpack_dvec(ns, &model->Z, ns, value, 1);
+    }
+    else if (!strcmp(field, "zl"))
+    {
+        blasfeo_unpack_dvec(ns, &model->z, 0, value, 1);
+    }
+    else if (!strcmp(field, "zu"))
+    {
+        blasfeo_unpack_dvec(ns, &model->z, ns, value, 1);
+    }
+    else if (!strcmp(field, "scaling"))
+    {
+        value[0] = model->scaling;
+    }
+    else
+    {
+        printf("\nerror: field %s not available in ocp_nlp_cost_ls_model_get\n", field);
+        exit(1);
+    }
+    return status;
+}
+
+
+double *ocp_nlp_cost_ls_model_get_scaling_ptr(void *in_)
+{
+    ocp_nlp_cost_ls_model *model = in_;
+    return &model->scaling;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 //                                   options                                  //
@@ -411,6 +493,7 @@ void ocp_nlp_cost_ls_opts_initialize_default(void *config_,
 {
     ocp_nlp_cost_ls_opts *opts = opts_;
     opts->compute_hess = 1;
+    opts->add_hess_contribution = 0;
 
     return;
 }
@@ -440,11 +523,16 @@ void ocp_nlp_cost_ls_opts_set(void *config_, void *opts_, const char *field, voi
         int* int_ptr = value;
         opts->compute_hess = *int_ptr;
     }
-    else if(!strcmp(field, "with_solution_sens_wrt_params"))
+    else if (!strcmp(field, "with_solution_sens_wrt_params"))
     {
         // not implemented yet
         // int *opt_val = (int *) value;
         // opts->with_solution_sens_wrt_params = *opt_val;
+    }
+    else if (!strcmp(field, "add_hess_contribution"))
+    {
+        int* int_ptr = value;
+        opts->add_hess_contribution = *int_ptr;
     }
     else
     {
@@ -456,6 +544,13 @@ void ocp_nlp_cost_ls_opts_set(void *config_, void *opts_, const char *field, voi
 
 }
 
+
+int* ocp_nlp_cost_ls_opts_get_add_hess_contribution_ptr(void *config_, void *opts_)
+{
+    ocp_nlp_cost_ls_opts *opts = opts_;
+
+    return &opts->add_hess_contribution;
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -799,6 +894,9 @@ void ocp_nlp_cost_ls_update_qp_matrices(void *config_, void *dims_,
     struct blasfeo_dmat *Cyt = &model->Cyt;
     ocp_nlp_cost_ls_opts *opts = opts_;
 
+
+
+
     if (nz > 0)
     { // eliminate algebraic variables and update Cyt and y_ref
 
@@ -827,11 +925,16 @@ void ocp_nlp_cost_ls_update_qp_matrices(void *config_, void *dims_,
         }
 
         // add hessian of the cost contribution
+        double prev_RSQ_factor = 0.0;
+        if (opts->add_hess_contribution)
+        {
+            prev_RSQ_factor = 1.0;
+        }
         if (opts->compute_hess)
         {
-            // RSQrq += scaling * tmp_nv_ny * tmp_nv_ny^T
+            // RSQrq = scaling * tmp_nv_ny * tmp_nv_ny^T
             blasfeo_dsyrk_ln(nu + nx, ny, model->scaling, &work->tmp_nv_ny, 0, 0, &work->tmp_nv_ny,
-                                0, 0, 1.0, memory->RSQrq, 0, 0, memory->RSQrq, 0, 0);
+                                0, 0, prev_RSQ_factor, memory->RSQrq, 0, 0, memory->RSQrq, 0, 0);
         }
 
         // compute gradient, function
@@ -846,8 +949,16 @@ void ocp_nlp_cost_ls_update_qp_matrices(void *config_, void *dims_,
     {
         if (opts->compute_hess)
         {
-            // add hessian of the cost contribution
-            blasfeo_dgead(nx + nu, nx + nu, 1.0, &memory->hess, 0, 0, memory->RSQrq, 0, 0);
+            if (opts->add_hess_contribution)
+            {
+                // add
+                blasfeo_dgead(nx + nu, nx + nu, 1.0, &memory->hess, 0, 0, memory->RSQrq, 0, 0);
+            }
+            else
+            {
+                // write cost contribution into hessian
+                blasfeo_dgecp(nx + nu, nx + nu, &memory->hess, 0, 0, memory->RSQrq, 0, 0);
+            }
         }
 
         // compute gradient, function
@@ -1029,11 +1140,14 @@ void ocp_nlp_cost_ls_config_initialize_default(void *config_, int stage)
     config->model_calculate_size = &ocp_nlp_cost_ls_model_calculate_size;
     config->model_assign = &ocp_nlp_cost_ls_model_assign;
     config->model_set = &ocp_nlp_cost_ls_model_set;
+    config->model_get = &ocp_nlp_cost_ls_model_get;
+    config->model_get_scaling_ptr = &ocp_nlp_cost_ls_model_get_scaling_ptr;
     config->opts_calculate_size = &ocp_nlp_cost_ls_opts_calculate_size;
     config->opts_assign = &ocp_nlp_cost_ls_opts_assign;
     config->opts_initialize_default = &ocp_nlp_cost_ls_opts_initialize_default;
     config->opts_update = &ocp_nlp_cost_ls_opts_update;
     config->opts_set = &ocp_nlp_cost_ls_opts_set;
+    config->opts_get_add_hess_contribution_ptr = &ocp_nlp_cost_ls_opts_get_add_hess_contribution_ptr;
     config->memory_calculate_size = &ocp_nlp_cost_ls_memory_calculate_size;
     config->memory_assign = &ocp_nlp_cost_ls_memory_assign;
     config->memory_get_fun_ptr = &ocp_nlp_cost_ls_memory_get_fun_ptr;
