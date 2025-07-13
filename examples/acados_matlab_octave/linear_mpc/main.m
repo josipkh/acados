@@ -82,9 +82,6 @@ ocp.constraints.idxbu = 0:3;                        % zero-based indices
 ocp.constraints.lbu = [9.6; 9.6; 9.6; 9.6] - u0;    % input lower bounds
 ocp.constraints.ubu = [13; 13; 13; 13] - u0;        % input upper bounds
 
-% placeholder for the initial state constraint
-ocp.constraints.x0 = zeros(nx,1);
-
 % state constraints on the first, second and sixth state
 % (not applied to the initial state)
 ocp.constraints.idxbx = [0 1 5];                % zero-based indices

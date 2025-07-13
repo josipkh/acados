@@ -126,8 +126,6 @@ model.con_h_expr = model.u;
 ocp.constraints.lh = -U_max;
 ocp.constraints.uh = U_max;
 
-ocp.constraints.x0 = x0;
-
 %% OCP SOLVER
 ocp_solver = AcadosOcpSolver(ocp);
 

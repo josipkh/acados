@@ -754,6 +754,7 @@ classdef AcadosOcp < handle
             constraints = self.constraints;
             opts = self.solver_options;
 
+            self.check_if_x0_explicitly_defined();
             self.detect_cost_and_constraints();
 
             if isempty(opts.N_horizon) && isempty(dims.N)
@@ -1487,6 +1488,14 @@ classdef AcadosOcp < handle
             if fid == -1, error('Cannot create JSON file'); end
             fwrite(fid, json_string, 'char');
             fclose(fid);
+        end
+
+        function check_if_x0_explicitly_defined(self)
+            if ~self.constraints.has_x0
+                disp("Initial state constraint is not explicitly defined, setting to equality with zeros of appropriate dimension.")
+                disp("Don't forget to set the correct values with ocp_solver.set('constr_x0', ...) before solving!")
+                self.constraints.x0 = zeros(self.dims.nx, 1);
+            end
         end
     end % methods
 end
