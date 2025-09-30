@@ -1,7 +1,7 @@
 function acados_install_windows(varargin)
 % acados_install_windows([CmakeConfigString])
 % Install script for acados on windows
-% CmakeConfigString - config string for the CMAKE command [Default='-DBUILD_SHARED_LIBS=OFF -DACADOS_WITH_OSQP=OFF']
+% CmakeConfigString - config string for the CMAKE command [Default='-DBUILD_SHARED_LIBS=OFF -DACADOS_WITH_OSQP=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5']
 
 
     switch(nargin)
@@ -16,21 +16,21 @@ function acados_install_windows(varargin)
     % Derive the path for the acados root
     fullPath = mfilename('fullpath');
     % Extract path for this file
-    [folderPath,~,~]=fileparts(fullPath);
+    [folderPath,~,~] = fileparts(fullPath);
     % Remove the two top directories to get the acados path
-    [folderPath,~,~]=fileparts(folderPath);
-    [acadosPath,~,~]=fileparts(folderPath);
+    [folderPath,~,~] = fileparts(folderPath);
+    [acadosPath,~,~] = fileparts(folderPath);
 
     % backward to forward slashes
     acadosPath = strrep(acadosPath, '\', '/');
-    acadosBuildPath=fullfile(acadosPath,'build');
+    acadosBuildPath = fullfile(acadosPath,'build');
 
     %% Acados installation instructions:
     % Add the subfolders bin and x86_64-w64-mingw32\bin of the above mentioned mingw installation to your environment variable PATH.
     fprintf('Setting up environment PATH variable\n');
 
     % Store the current PATH environment variable value
-    origEnvPath=getenv('PATH');
+    origEnvPath = getenv('PATH');
     % Read the mex C compiler configuration and extract the location
     cCompilerConfig = mex.getCompilerConfigurations('C');
     pathToCompilerLocation = cCompilerConfig.Location;
@@ -45,10 +45,22 @@ function acados_install_windows(varargin)
     % cd build
     fprintf('Creating build dir in %s\n', acadosBuildPath);
     setenv('ACADOS_INSTALL_DIR', acadosPath);
+
+    if isfolder(acadosBuildPath)
+        fprintf("Found an existing build folder, removing.\n");
+        rmdir(acadosBuildPath, "s");
+    end
+
+    acadosLibPath = fullfile(acadosPath,'lib');
+    if isfolder(acadosLibPath)
+        fprintf("Found an existing lib folder, removing.\n");
+        rmdir(acadosLibPath, "s");
+    end
+
     mkdir(acadosBuildPath);
     cd(acadosBuildPath);
 
-    disp(['ACADOS_INSTALL_DIR is' acadosPath]);
+    disp(['ACADOS_INSTALL_DIR is ' acadosPath]);
 
     %% Acados installation instructions:
     % cmake.exe -G "MinGW Makefiles" -DACADOS_INSTALL_DIR="$ACADOS_INSTALL_DIR" -DBUILD_SHARED_LIBS=OFF -DACADOS_WITH_OSQP=ON ..
@@ -101,13 +113,13 @@ function acados_install_windows(varargin)
 
     %% Download external dependencies
     % casadi
-    fprintf('Downloading casadi\n');
+    fprintf('Checking acados requirements...\n');
     addpath(fullfile(acadosPath, 'interfaces', 'acados_matlab_octave'));
     run('acados_env_variables_windows');
     check_acados_requirements(true);
 
     %% renderer
-    fprintf('Install the template renderer\n');
+    fprintf('Checking for the template renderer...\n');
     acados_root_dir = getenv('ACADOS_INSTALL_DIR');
     %% check if t_renderer is available -> download if not
     t_renderer_location = fullfile(acados_root_dir, 'bin', 't_renderer.exe');
@@ -116,4 +128,5 @@ function acados_install_windows(varargin)
         set_up_t_renderer( t_renderer_location )
     end
 
+    fprintf('acados was installed successfully!\n')
 end
